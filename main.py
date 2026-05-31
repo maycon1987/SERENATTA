@@ -31,7 +31,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(
     title="Serenatta API",
     description="Backend da plataforma Serenatta - músicas personalizadas emocionais",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # =========================
@@ -200,6 +200,28 @@ class PagamentoPixCreate(BaseModel):
 
 
 # =========================
+# MODELS CARTÃO
+# =========================
+class IdentificacaoCartao(BaseModel):
+    type: str = "CPF"
+    number: str
+
+
+class PayerCartao(BaseModel):
+    email: str
+    identification: IdentificacaoCartao
+
+
+class PagamentoCartaoCreate(BaseModel):
+    pedido: PedidoCreate
+    token: str
+    payment_method_id: str
+    issuer_id: Optional[str] = None
+    installments: int = 1
+    payer: PayerCartao
+
+
+# =========================
 # ROTAS BASE
 # =========================
 @app.get("/")
@@ -348,6 +370,108 @@ def criar_pagamento_pix(payload: PagamentoPixCreate):
 
 
 # =========================
+# PAGAMENTO CARTÃO - MERCADO PAGO
+# =========================
+@app.post("/pagamentos/cartao")
+def criar_pagamento_cartao(payload: PagamentoCartaoCreate):
+    try:
+        pedido_dados = payload.pedido.model_dump(exclude_none=True)
+        pedido_dados = validar_pedido_basico(pedido_dados)
+
+        pedido_dados["status"] = "novo"
+        pedido_dados["valor"] = 79.00
+        pedido_dados["pagamento_status"] = "pendente"
+        pedido_dados["metodo_pagamento"] = payload.payment_method_id
+
+        pedido_response = supabase.table("pedidos").insert(pedido_dados).execute()
+
+        if not pedido_response.data:
+            raise HTTPException(status_code=500, detail="Erro ao criar pedido no Supabase.")
+
+        pedido_criado = pedido_response.data[0]
+        pedido_id = pedido_criado["id"]
+        nome_cliente = pedido_dados.get("nome_cliente", "Cliente Serenatta")
+
+        cpf_limpo = re.sub(r"\D", "", payload.payer.identification.number)
+
+        mp_payload = {
+            "transaction_amount": 79.00,
+            "description": "Serenatta - Música personalizada Promoção Dia dos Namorados",
+            "token": payload.token,
+            "installments": payload.installments,
+            "payment_method_id": payload.payment_method_id,
+            "external_reference": pedido_id,
+            "payer": {
+                "email": payload.payer.email,
+                "first_name": nome_cliente,
+                "identification": {
+                    "type": "CPF",
+                    "number": cpf_limpo
+                }
+            },
+            "metadata": {
+                "pedido_id": pedido_id,
+                "telefone": pedido_dados.get("telefone"),
+                "produto": "Serenatta - Música personalizada",
+                "plano": "Promoção Dia dos Namorados"
+            }
+        }
+
+        if payload.issuer_id:
+            mp_payload["issuer_id"] = payload.issuer_id
+
+        mp_response = requests.post(
+            "https://api.mercadopago.com/v1/payments",
+            headers=mercado_pago_headers(),
+            json=mp_payload,
+            timeout=30
+        )
+
+        if mp_response.status_code >= 400:
+            supabase.table("pedidos").update({
+                "pagamento_status": "erro_mercado_pago"
+            }).eq("id", pedido_id).execute()
+
+            raise HTTPException(
+                status_code=mp_response.status_code,
+                detail=mp_response.text
+            )
+
+        pagamento = mp_response.json()
+        payment_id = str(pagamento.get("id"))
+        status_mp = pagamento.get("status")
+        status_detail = pagamento.get("status_detail", "")
+
+        update_pagamento = {
+            "mercado_pago_payment_id": payment_id,
+            "pagamento_status": status_mp,
+            "metodo_pagamento": payload.payment_method_id,
+        }
+
+        if status_mp == "approved":
+            update_pagamento["pago_em"] = datetime.now(timezone.utc).isoformat()
+            update_pagamento["status"] = "em_analise"
+
+        supabase.table("pedidos").update(update_pagamento).eq("id", pedido_id).execute()
+
+        return {
+            "status": "ok",
+            "mensagem": "Pagamento com cartão processado.",
+            "pedido_id": pedido_id,
+            "payment_id": payment_id,
+            "payment_status": status_mp,
+            "status_detail": status_detail,
+            "aprovado": status_mp == "approved"
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
 # CONSULTAR STATUS DO PAGAMENTO
 # =========================
 @app.get("/pagamentos/{payment_id}/status")
@@ -468,20 +592,26 @@ def cliente_buscar_pedido(
             .select("*")
             .eq("id", pedido_id)
             .eq("email", email_limpo)
-            .single()
+            .limit(1)
             .execute()
         )
 
+        if not response.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Pedido não encontrado para este cliente."
+            )
+
         return {
             "status": "ok",
-            "pedido": response.data
+            "pedido": response.data[0]
         }
 
-    except Exception:
-        raise HTTPException(
-            status_code=404,
-            detail="Pedido não encontrado para este cliente."
-        )
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =========================
@@ -571,17 +701,23 @@ def admin_buscar_pedido(
             .table("pedidos")
             .select("*")
             .eq("id", pedido_id)
-            .single()
+            .limit(1)
             .execute()
         )
 
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado.")
+
         return {
             "status": "ok",
-            "pedido": response.data
+            "pedido": response.data[0]
         }
 
-    except Exception:
-        raise HTTPException(status_code=404, detail="Pedido não encontrado.")
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =========================
@@ -734,6 +870,7 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         resumo_planos = {}
         resumo_pagamentos = {}
         revisoes_pendentes = 0
+        faturamento_aprovado = 0.0
 
         for pedido in pedidos:
             status = pedido.get("status") or "sem_status"
@@ -747,10 +884,14 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
             if pedido.get("revisao_status") in ["nova", "em_analise", "em_ajuste"]:
                 revisoes_pendentes += 1
 
+            if pagamento_status == "approved":
+                faturamento_aprovado += float(pedido.get("valor") or 0)
+
         return {
             "status": "ok",
             "total_pedidos": len(pedidos),
             "revisoes_pendentes": revisoes_pendentes,
+            "faturamento_aprovado": round(faturamento_aprovado, 2),
             "por_status": resumo_status,
             "por_plano": resumo_planos,
             "por_pagamento": resumo_pagamentos,
