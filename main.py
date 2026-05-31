@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client
 import os
@@ -26,12 +26,22 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================
+# CONFIGURAÇÕES DE PARCELAMENTO
+# =========================
+VALOR_TOTAL = 79.00
+PARCELAS_DISPONIVEIS = [
+    {"parcelas": 1, "valor_parcela": 79.00, "total": 79.00, "label": "1x R$ 79,00 (sem juros)"},
+    {"parcelas": 2, "valor_parcela": 39.50, "total": 79.00, "label": "2x R$ 39,50 (sem juros)"},
+]
+PARCELAS_MAXIMAS = 2
+
+# =========================
 # APP
 # =========================
 app = FastAPI(
     title="Serenatta API",
     description="Backend da plataforma Serenatta - músicas personalizadas emocionais",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 # =========================
@@ -60,7 +70,6 @@ def verificar_admin(x_admin_token: Optional[str] = Header(None)):
             status_code=500,
             detail="ADMIN_TOKEN não configurado no servidor."
         )
-
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(
             status_code=401,
@@ -76,13 +85,10 @@ def validar_pedido_basico(dados: Dict[str, Any]):
 
     if len(nome_cliente) < 2:
         raise HTTPException(status_code=400, detail="Nome do cliente é obrigatório.")
-
     if len(telefone) < 10:
         raise HTTPException(status_code=400, detail="WhatsApp válido é obrigatório.")
-
     if "@" not in email:
         raise HTTPException(status_code=400, detail="E-mail válido é obrigatório.")
-
     if len(plano) < 2:
         raise HTTPException(status_code=400, detail="Plano é obrigatório.")
 
@@ -94,13 +100,23 @@ def validar_pedido_basico(dados: Dict[str, Any]):
     return dados
 
 
+def validar_parcelas(installments: int) -> int:
+    if installments < 1:
+        installments = 1
+    if installments > PARCELAS_MAXIMAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Número de parcelas inválido. Máximo permitido: {PARCELAS_MAXIMAS}x."
+        )
+    return installments
+
+
 def mercado_pago_headers():
     if not MERCADO_PAGO_ACCESS_TOKEN:
         raise HTTPException(
             status_code=500,
             detail="MERCADO_PAGO_ACCESS_TOKEN não configurado no servidor."
         )
-
     return {
         "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -111,7 +127,6 @@ def mercado_pago_headers():
 def atualizar_pagamento_no_supabase(payment_id: str):
     try:
         url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
-
         headers = {
             "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
             "Content-Type": "application/json"
@@ -151,7 +166,6 @@ def atualizar_pagamento_no_supabase(payment_id: str):
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -163,19 +177,14 @@ class PedidoCreate(BaseModel):
     nome_cliente: Optional[str] = None
     telefone: Optional[str] = None
     email: Optional[str] = None
-
     tipo_homenagem: Optional[str] = None
     nome_homenageado: Optional[str] = None
-
     estilo_musical: Optional[str] = None
     voz: Optional[str] = None
-
     qualidades: Optional[str] = None
     memorias: Optional[str] = None
     mensagem_coracao: Optional[str] = None
-
     plano: Optional[str] = None
-
     foto_url: Optional[str] = None
 
 
@@ -199,9 +208,6 @@ class PagamentoPixCreate(BaseModel):
     pedido: PedidoCreate
 
 
-# =========================
-# MODELS CARTÃO
-# =========================
 class IdentificacaoCartao(BaseModel):
     type: str = "CPF"
     number: str
@@ -229,6 +235,7 @@ def home():
     return {
         "status": "online",
         "app": "Serenatta API",
+        "versao": "1.5.0",
         "mensagem": "Backend da plataforma Serenatta funcionando.",
         "docs": "/docs"
     }
@@ -246,6 +253,18 @@ def health():
 
 
 # =========================
+# PARCELAS DISPONÍVEIS (para o frontend consultar)
+# =========================
+@app.get("/parcelas")
+def listar_parcelas():
+    return {
+        "status": "ok",
+        "valor_total": VALOR_TOTAL,
+        "parcelas": PARCELAS_DISPONIVEIS
+    }
+
+
+# =========================
 # ROTA PÚBLICA - CRIAR PEDIDO SEM PAGAMENTO
 # =========================
 @app.post("/pedidos")
@@ -255,7 +274,7 @@ def criar_pedido(pedido: PedidoCreate):
         dados = validar_pedido_basico(dados)
 
         dados["status"] = "novo"
-        dados["valor"] = 79.00
+        dados["valor"] = VALOR_TOTAL
         dados["pagamento_status"] = "pendente"
 
         response = supabase.table("pedidos").insert(dados).execute()
@@ -268,7 +287,6 @@ def criar_pedido(pedido: PedidoCreate):
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -283,7 +301,7 @@ def criar_pagamento_pix(payload: PagamentoPixCreate):
         pedido_dados = validar_pedido_basico(pedido_dados)
 
         pedido_dados["status"] = "novo"
-        pedido_dados["valor"] = 79.00
+        pedido_dados["valor"] = VALOR_TOTAL
         pedido_dados["pagamento_status"] = "pendente"
         pedido_dados["metodo_pagamento"] = "pix"
 
@@ -300,7 +318,7 @@ def criar_pagamento_pix(payload: PagamentoPixCreate):
         telefone_cliente = pedido_dados.get("telefone")
 
         mp_payload = {
-            "transaction_amount": 79.00,
+            "transaction_amount": VALOR_TOTAL,
             "description": "Serenatta - Música personalizada Promoção Dia dos Namorados",
             "payment_method_id": "pix",
             "external_reference": pedido_id,
@@ -364,22 +382,24 @@ def criar_pagamento_pix(payload: PagamentoPixCreate):
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # =========================
-# PAGAMENTO CARTÃO - MERCADO PAGO
+# PAGAMENTO CARTÃO - MERCADO PAGO (até 2x sem juros)
 # =========================
 @app.post("/pagamentos/cartao")
 def criar_pagamento_cartao(payload: PagamentoCartaoCreate):
     try:
+        # Valida parcelas (máximo 2x)
+        installments = validar_parcelas(payload.installments)
+
         pedido_dados = payload.pedido.model_dump(exclude_none=True)
         pedido_dados = validar_pedido_basico(pedido_dados)
 
         pedido_dados["status"] = "novo"
-        pedido_dados["valor"] = 79.00
+        pedido_dados["valor"] = VALOR_TOTAL
         pedido_dados["pagamento_status"] = "pendente"
         pedido_dados["metodo_pagamento"] = payload.payment_method_id
 
@@ -394,11 +414,14 @@ def criar_pagamento_cartao(payload: PagamentoCartaoCreate):
 
         cpf_limpo = re.sub(r"\D", "", payload.payer.identification.number)
 
+        # Calcula valor da parcela
+        valor_parcela = round(VALOR_TOTAL / installments, 2)
+
         mp_payload = {
-            "transaction_amount": 79.00,
-            "description": "Serenatta - Música personalizada Promoção Dia dos Namorados",
+            "transaction_amount": VALOR_TOTAL,
+            "description": f"Serenatta - Música personalizada ({installments}x de R$ {valor_parcela:.2f})",
             "token": payload.token,
-            "installments": payload.installments,
+            "installments": installments,
             "payment_method_id": payload.payment_method_id,
             "external_reference": pedido_id,
             "payer": {
@@ -413,7 +436,9 @@ def criar_pagamento_cartao(payload: PagamentoCartaoCreate):
                 "pedido_id": pedido_id,
                 "telefone": pedido_dados.get("telefone"),
                 "produto": "Serenatta - Música personalizada",
-                "plano": "Promoção Dia dos Namorados"
+                "plano": "Promoção Dia dos Namorados",
+                "parcelas": installments,
+                "valor_parcela": valor_parcela
             }
         }
 
@@ -461,12 +486,14 @@ def criar_pagamento_cartao(payload: PagamentoCartaoCreate):
             "payment_id": payment_id,
             "payment_status": status_mp,
             "status_detail": status_detail,
-            "aprovado": status_mp == "approved"
+            "aprovado": status_mp == "approved",
+            "parcelas": installments,
+            "valor_parcela": valor_parcela,
+            "valor_total": VALOR_TOTAL
         }
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -491,7 +518,6 @@ def consultar_status_pagamento(payment_id: str):
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -570,7 +596,6 @@ def cliente_listar_pedidos(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -609,7 +634,6 @@ def cliente_buscar_pedido(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -654,7 +678,6 @@ def cliente_solicitar_revisao(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -715,7 +738,6 @@ def admin_buscar_pedido(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -765,7 +787,6 @@ def admin_atualizar_status(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -844,7 +865,6 @@ def admin_atualizar_revisao_status(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
